@@ -29,6 +29,8 @@ RUN pnpm install --frozen-lockfile
 
 # Copy frontend source and build
 COPY frontend/ ./
+# 前端 LegalDocumentView 通过 ../../../../docs/legal 引用合规 md,需放到 /app/docs
+COPY docs/ /app/docs/
 RUN pnpm run build
 
 # -----------------------------------------------------------------------------

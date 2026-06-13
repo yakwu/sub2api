@@ -11,6 +11,11 @@
 *.md
 !deploy/DOCKER.md
 docs/
+# 前端构建需要引用 docs/legal/admin-compliance.*.md(管理员合规弹窗),保留进上下文
+!docs/
+!docs/legal/
+!docs/legal/admin-compliance.zh.md
+!docs/legal/admin-compliance.en.md
 
 # IDE
 .idea/
