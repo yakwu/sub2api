@@ -10,9 +10,8 @@
 
 services:
   sub2api:
-    build:
-      context: ..
-      dockerfile: Dockerfile
+    # 直接用 hedeqiang 预构建镜像(其 release 分支构建,多架构含 arm64),不本地构建
+    image: hedeqiang/sub2api:latest
     container_name: sub2api-dev
     restart: unless-stopped
     ports:
