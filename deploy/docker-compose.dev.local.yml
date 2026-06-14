@@ -1,0 +1,6 @@
+# 本地验证用覆盖文件:让 sub2api-dev 跑本地构建的镜像(含 group_by=model 改动)
+# 用法:docker compose -f docker-compose.dev.yml -f docker-compose.dev.local.yml up -d --force-recreate sub2api
+# 回退:去掉本文件,docker compose -f docker-compose.dev.yml up -d --force-recreate sub2api(恢复上游镜像)
+services:
+  sub2api:
+    image: sub2api:dev-local
