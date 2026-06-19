@@ -11,11 +11,11 @@
 *.md
 !deploy/DOCKER.md
 docs/
-# 前端构建需要引用 docs/legal/admin-compliance.*.md(管理员合规弹窗),保留进上下文
-!docs/
+# admin-compliance gate (LegalDocumentView.vue) build-time imports
+# docs/legal/*.md?raw into the frontend bundle; keep that subtree in the
+# Docker build context even though docs/ is otherwise excluded.
 !docs/legal/
-!docs/legal/admin-compliance.zh.md
-!docs/legal/admin-compliance.en.md
+!docs/legal/*.md
 
 # IDE
 .idea/
