@@ -60,6 +60,10 @@ type OpsRepository interface {
 	CreateAlertSilence(ctx context.Context, input *OpsAlertSilence) (*OpsAlertSilence, error)
 	IsAlertSilenced(ctx context.Context, ruleID int64, platform string, groupID *int64, region *string, now time.Time) (bool, error)
 
+	// GetWindowCacheTokenSums 聚合 usage_logs 在 [start,end) 窗口内的输入/缓存 token，
+	// 供「缓存命中率」告警按 account/platform/group 维度计算命中率。
+	GetWindowCacheTokenSums(ctx context.Context, scope OpsCacheTokenScope, start, end time.Time) (OpsCacheTokenSums, error)
+
 	// Pre-aggregation (hourly/daily) used for long-window dashboard performance.
 	UpsertHourlyMetrics(ctx context.Context, startTime, endTime time.Time) error
 	UpsertDailyMetrics(ctx context.Context, startTime, endTime time.Time) error
@@ -71,6 +75,20 @@ type OpsRepository interface {
 type DeletedKeyAuditResult struct {
 	UserID  int64
 	KeyName string
+}
+
+// OpsCacheTokenScope 限定缓存命中率统计范围；字段均为可选，零值表示该维度不过滤。
+type OpsCacheTokenScope struct {
+	Platform  string
+	GroupID   *int64
+	AccountID *int64
+}
+
+// OpsCacheTokenSums 是窗口内输入/缓存 token 的聚合结果（均已归一为不含缓存的纯输入 + 缓存读/写）。
+type OpsCacheTokenSums struct {
+	InputTokens         int64
+	CacheReadTokens     int64
+	CacheCreationTokens int64
 }
 
 type OpsInsertErrorLogInput struct {
