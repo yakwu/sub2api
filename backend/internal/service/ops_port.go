@@ -64,6 +64,10 @@ type OpsRepository interface {
 	// 供「缓存命中率」告警按 account/platform/group 维度计算命中率。
 	GetWindowCacheTokenSums(ctx context.Context, scope OpsCacheTokenScope, start, end time.Time) (OpsCacheTokenSums, error)
 
+	// Per-account upstream error rate (for the account error-rate monitor).
+	// 返回窗口 [start,end) 内每个有上游错误的账号的请求总数与上游错误数,口径与 upstream_error_rate 一致。
+	GetAccountErrorRates(ctx context.Context, start, end time.Time) ([]OpsAccountErrorRateRow, error)
+
 	// Pre-aggregation (hourly/daily) used for long-window dashboard performance.
 	UpsertHourlyMetrics(ctx context.Context, startTime, endTime time.Time) error
 	UpsertDailyMetrics(ctx context.Context, startTime, endTime time.Time) error
