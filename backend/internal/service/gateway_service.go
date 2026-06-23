@@ -1767,10 +1767,10 @@ func (s *GatewayService) SelectAccountWithLoadAwareness(ctx context.Context, gro
 	}
 
 	// 获取路由计划：智能路由策略（first-match-wins）优先，未命中回退旧版模型路由。
-	routingAccountIDs, routingHardRestrict := s.routingPlanForRequest(ctx, group, groupID, requestedModel, platform)
+	routingAccountIDs, routingHardRestrict, routingPriorityByID := s.routingPlanForRequest(ctx, group, groupID, requestedModel, platform)
 	if s.debugModelRoutingEnabled() && len(routingAccountIDs) > 0 {
-		logger.LegacyPrintf("service.gateway", "[Routing] load-aware plan: group_id=%v model=%s session=%s ids=%v hard_restrict=%v sticky_account=%d",
-			derefGroupID(groupID), requestedModel, shortSessionHash(sessionHash), routingAccountIDs, routingHardRestrict, stickyAccountID)
+		logger.LegacyPrintf("service.gateway", "[Routing] load-aware plan: group_id=%v model=%s session=%s ids=%v hard_restrict=%v priorities=%v sticky_account=%d",
+			derefGroupID(groupID), requestedModel, shortSessionHash(sessionHash), routingAccountIDs, routingHardRestrict, routingPriorityByID, stickyAccountID)
 	}
 
 	// ============ Layer 1: 模型路由优先选择（优先级高于粘性会话） ============
@@ -1947,27 +1947,14 @@ func (s *GatewayService) SelectAccountWithLoadAwareness(ctx context.Context, gro
 			}
 
 			if len(routingAvailable) > 0 {
-				// 排序：优先级 > 负载率 > 最后使用时间
-				sort.SliceStable(routingAvailable, func(i, j int) bool {
-					a, b := routingAvailable[i], routingAvailable[j]
-					if a.account.Priority != b.account.Priority {
-						return a.account.Priority < b.account.Priority
+				// 排序：有效优先级 > 负载率 > 最后使用时间（同优先级账号按负载 / LRU 均衡）。
+				// 命中智能路由策略时使用策略指定的账号优先级，否则回退到账号自身优先级。
+				sortRoutingCandidatesByPriority(routingAvailable, func(a *Account) int {
+					if routingPriorityByID != nil {
+						return routingPriorityByID[a.ID]
 					}
-					if a.loadInfo.LoadRate != b.loadInfo.LoadRate {
-						return a.loadInfo.LoadRate < b.loadInfo.LoadRate
-					}
-					switch {
-					case a.account.LastUsedAt == nil && b.account.LastUsedAt != nil:
-						return true
-					case a.account.LastUsedAt != nil && b.account.LastUsedAt == nil:
-						return false
-					case a.account.LastUsedAt == nil && b.account.LastUsedAt == nil:
-						return false
-					default:
-						return a.account.LastUsedAt.Before(*b.account.LastUsedAt)
-					}
+					return a.Priority
 				})
-				shuffleWithinSortGroups(routingAvailable)
 
 				// 4. 尝试获取槽位
 				for _, item := range routingAvailable {
@@ -2211,13 +2198,17 @@ func (s *GatewayService) SelectAccountWithLoadAwareness(ctx context.Context, gro
 			}
 		}
 
-		// 分层过滤选择：优先级 → 负载率 → LRU
+		// 分层过滤选择：优先级 →（可选）最早重置 → 负载率 → LRU
 		for len(available) > 0 {
 			// 1. 取优先级最小的集合
 			candidates := filterByMinPriority(available)
-			// 2. 取负载率最低的集合
+			// 2. （可选）use-it-or-lose-it：优先选用会话窗口最早重置的账号
+			if cfg.PreferSoonestReset {
+				candidates = filterBySoonestReset(candidates)
+			}
+			// 3. 取负载率最低的集合
 			candidates = filterByMinLoadRate(candidates)
-			// 3. LRU 选择最久未用的账号
+			// 4. LRU 选择最久未用的账号
 			selected := selectByLRU(candidates, preferOAuth)
 			if selected == nil {
 				break
@@ -2343,7 +2334,10 @@ func (s *GatewayService) ResolveGroupByID(ctx context.Context, groupID int64) (*
 //	hardRestrict=false : 命中 prefer 策略或旧版模型路由，候选账号优先；不可用时回退全量（保持原行为）。
 //
 // 评估顺序：智能路由策略（first-match-wins）优先，未命中再回退到旧版 Group.ModelRouting（仅 anthropic）。
-func (s *GatewayService) routingPlanForRequest(ctx context.Context, group *Group, groupID *int64, requestedModel string, platform string) ([]int64, bool) {
+// routingPlanForRequest 返回命中策略的目标账号 ID 列表、是否硬路由（restrict），以及账号优先级映射。
+// priorityByID 为智能路由策略指定的账号优先级（id -> 优先级，数值越小越优先；相同数值为同一优先级，
+// 再按负载 / LRU 选择）；命中策略时非空，旧版分组模型路由时为 nil（此时回退使用账号自身优先级）。
+func (s *GatewayService) routingPlanForRequest(ctx context.Context, group *Group, groupID *int64, requestedModel string, platform string) ([]int64, bool, map[int64]int) {
 	// 1) 智能路由策略引擎
 	if s.routingStrategyService != nil {
 		ua := UserAgentFromContext(ctx)
@@ -2358,24 +2352,24 @@ func (s *GatewayService) routingPlanForRequest(ctx context.Context, group *Group
 		if dec.HasMatch() {
 			if len(dec.RestrictIDs) > 0 {
 				if s.debugModelRoutingEnabled() {
-					logger.LegacyPrintf("service.gateway", "[RoutingStrategy] matched restrict: strategy=%d(%s) group_id=%v model=%s client=%s ids=%v",
-						dec.MatchedID, dec.MatchedName, derefGroupID(groupID), requestedModel, mc.ClientType, dec.RestrictIDs)
+					logger.LegacyPrintf("service.gateway", "[RoutingStrategy] matched restrict: strategy=%d(%s) group_id=%v model=%s client=%s ids=%v priorities=%v",
+						dec.MatchedID, dec.MatchedName, derefGroupID(groupID), requestedModel, mc.ClientType, dec.RestrictIDs, dec.AccountPriorities)
 				}
-				return dec.RestrictIDs, true
+				return dec.RestrictIDs, true, dec.AccountPriorities
 			}
 			if len(dec.PreferIDs) > 0 {
 				if s.debugModelRoutingEnabled() {
-					logger.LegacyPrintf("service.gateway", "[RoutingStrategy] matched prefer: strategy=%d(%s) group_id=%v model=%s client=%s ids=%v",
-						dec.MatchedID, dec.MatchedName, derefGroupID(groupID), requestedModel, mc.ClientType, dec.PreferIDs)
+					logger.LegacyPrintf("service.gateway", "[RoutingStrategy] matched prefer: strategy=%d(%s) group_id=%v model=%s client=%s ids=%v priorities=%v",
+						dec.MatchedID, dec.MatchedName, derefGroupID(groupID), requestedModel, mc.ClientType, dec.PreferIDs, dec.AccountPriorities)
 				}
-				return dec.PreferIDs, false
+				return dec.PreferIDs, false, dec.AccountPriorities
 			}
 		}
 	}
 
 	// 2) 回退：旧版分组模型路由（仅 anthropic，软优先语义）
 	if requestedModel == "" || platform != PlatformAnthropic {
-		return nil, false
+		return nil, false, nil
 	}
 	g := group
 	if g == nil && groupID != nil {
@@ -2384,14 +2378,14 @@ func (s *GatewayService) routingPlanForRequest(ctx context.Context, group *Group
 		}
 	}
 	if g == nil || g.Platform != PlatformAnthropic {
-		return nil, false
+		return nil, false, nil
 	}
 	ids := g.GetRoutingAccountIDs(requestedModel)
 	if s.debugModelRoutingEnabled() && len(ids) > 0 {
 		logger.LegacyPrintf("service.gateway", "[ModelRoutingDebug] legacy routing lookup: group_id=%d model=%s enabled=%v rules=%d matched_ids=%v",
 			g.ID, requestedModel, g.ModelRoutingEnabled, len(g.ModelRouting), ids)
 	}
-	return ids, false
+	return ids, false, nil
 }
 
 func (s *GatewayService) resolveGatewayGroup(ctx context.Context, groupID *int64) (*Group, *int64, error) {
@@ -3007,6 +3001,39 @@ func filterByMinLoadRate(accounts []accountWithLoad) []accountWithLoad {
 	return result
 }
 
+// filterBySoonestReset 过滤出「会话窗口最早重置」的账号集合（use-it-or-lose-it）。
+// 仅保留拥有未来重置时间（SessionWindowEnd 在当前时间之后）且最早的账号；
+// 窗口为空或已过期的账号视为无活跃窗口、优先级最低。
+// 当所有账号都没有活跃窗口时，返回原集合（不改变后续 LRU 选择）。
+func filterBySoonestReset(accounts []accountWithLoad) []accountWithLoad {
+	if len(accounts) <= 1 {
+		return accounts
+	}
+	now := time.Now()
+	var minEnd *time.Time
+	for _, acc := range accounts {
+		end := acc.account.SessionWindowEnd
+		if end == nil || !now.Before(*end) {
+			continue
+		}
+		if minEnd == nil || end.Before(*minEnd) {
+			minEnd = end
+		}
+	}
+	if minEnd == nil {
+		// 没有任何账号拥有活跃窗口，保持原集合
+		return accounts
+	}
+	result := make([]accountWithLoad, 0, len(accounts))
+	for _, acc := range accounts {
+		end := acc.account.SessionWindowEnd
+		if end != nil && now.Before(*end) && end.Equal(*minEnd) {
+			result = append(result, acc)
+		}
+	}
+	return result
+}
+
 // selectByLRU 从集合中选择最久未用的账号
 // 如果有多个账号具有相同的最小 LastUsedAt，则随机选择一个
 func selectByLRU(accounts []accountWithLoad, preferOAuth bool) *accountWithLoad {
@@ -3105,6 +3132,48 @@ func shuffleWithinSortGroups(accounts []accountWithLoad) {
 		if j-i > 1 {
 			mathrand.Shuffle(j-i, func(a, b int) {
 				accounts[i+a], accounts[i+b] = accounts[i+b], accounts[i+a]
+			})
+		}
+		i = j
+	}
+}
+
+// sortRoutingCandidatesByPriority 对路由候选账号按 (有效优先级 -> 负载率 -> LRU) 稳定排序，
+// 并在 (有效优先级, 负载率, LastUsedAt) 完全相同的分组内随机打乱，均衡热点。
+// prioOf 返回某账号的“有效优先级”：智能路由策略指定的账号优先级，或旧版路由下账号自身的优先级。
+// 相同优先级的账号会进一步按负载率 / LRU 选择（即默认算法：优先级 + 负载 + LRU）。
+func sortRoutingCandidatesByPriority(items []accountWithLoad, prioOf func(*Account) int) {
+	sort.SliceStable(items, func(i, j int) bool {
+		pi, pj := prioOf(items[i].account), prioOf(items[j].account)
+		if pi != pj {
+			return pi < pj
+		}
+		if items[i].loadInfo.LoadRate != items[j].loadInfo.LoadRate {
+			return items[i].loadInfo.LoadRate < items[j].loadInfo.LoadRate
+		}
+		a, b := items[i].account, items[j].account
+		switch {
+		case a.LastUsedAt == nil && b.LastUsedAt != nil:
+			return true
+		case a.LastUsedAt != nil && b.LastUsedAt == nil:
+			return false
+		case a.LastUsedAt == nil && b.LastUsedAt == nil:
+			return false
+		default:
+			return a.LastUsedAt.Before(*b.LastUsedAt)
+		}
+	})
+	i := 0
+	for i < len(items) {
+		j := i + 1
+		for j < len(items) && prioOf(items[i].account) == prioOf(items[j].account) &&
+			items[i].loadInfo.LoadRate == items[j].loadInfo.LoadRate &&
+			sameLastUsedAt(items[i].account.LastUsedAt, items[j].account.LastUsedAt) {
+			j++
+		}
+		if j-i > 1 {
+			mathrand.Shuffle(j-i, func(a, b int) {
+				items[i+a], items[i+b] = items[i+b], items[i+a]
 			})
 		}
 		i = j
@@ -3240,7 +3309,14 @@ func shuffleWithinPriority(accounts []*Account) {
 // selectAccountForModelWithPlatform 选择单平台账户（完全隔离）
 func (s *GatewayService) selectAccountForModelWithPlatform(ctx context.Context, groupID *int64, sessionHash string, requestedModel string, excludedIDs map[int64]struct{}, platform string) (*Account, error) {
 	preferOAuth := platform == PlatformGemini
-	routingAccountIDs, routingHardRestrict := s.routingPlanForRequest(ctx, nil, groupID, requestedModel, platform)
+	routingAccountIDs, routingHardRestrict, routingPriorityByID := s.routingPlanForRequest(ctx, nil, groupID, requestedModel, platform)
+	// 有效优先级：命中智能路由策略时用策略指定的账号优先级，否则回退账号自身优先级。
+	routingPrioOf := func(a *Account) int {
+		if routingPriorityByID != nil {
+			return routingPriorityByID[a.ID]
+		}
+		return a.Priority
+	}
 
 	// require_privacy_set: 获取分组信息
 	var schedGroup *Group
@@ -3344,9 +3420,11 @@ func (s *GatewayService) selectAccountForModelWithPlatform(ctx context.Context, 
 				selected = acc
 				continue
 			}
-			if acc.Priority < selected.Priority {
+			// 有效优先级（策略指定或账号自身）更小者优先；相同则按 LRU / OAuth 偏好。
+			pa, ps := routingPrioOf(acc), routingPrioOf(selected)
+			if pa < ps {
 				selected = acc
-			} else if acc.Priority == selected.Priority {
+			} else if pa == ps {
 				switch {
 				case acc.LastUsedAt == nil && selected.LastUsedAt != nil:
 					selected = acc
@@ -3505,7 +3583,14 @@ func (s *GatewayService) selectAccountForModelWithPlatform(ctx context.Context, 
 // 查询原生平台账户 + 启用 mixed_scheduling 的 antigravity 账户
 func (s *GatewayService) selectAccountWithMixedScheduling(ctx context.Context, groupID *int64, sessionHash string, requestedModel string, excludedIDs map[int64]struct{}, nativePlatform string) (*Account, error) {
 	preferOAuth := nativePlatform == PlatformGemini
-	routingAccountIDs, routingHardRestrict := s.routingPlanForRequest(ctx, nil, groupID, requestedModel, nativePlatform)
+	routingAccountIDs, routingHardRestrict, routingPriorityByID := s.routingPlanForRequest(ctx, nil, groupID, requestedModel, nativePlatform)
+	// 有效优先级：命中智能路由策略时用策略指定的账号优先级，否则回退账号自身优先级。
+	routingPrioOf := func(a *Account) int {
+		if routingPriorityByID != nil {
+			return routingPriorityByID[a.ID]
+		}
+		return a.Priority
+	}
 
 	// require_privacy_set: 获取分组信息
 	var schedGroup *Group
@@ -3609,9 +3694,11 @@ func (s *GatewayService) selectAccountWithMixedScheduling(ctx context.Context, g
 				selected = acc
 				continue
 			}
-			if acc.Priority < selected.Priority {
+			// 有效优先级（策略指定或账号自身）更小者优先；相同则按 LRU / OAuth 偏好。
+			pa, ps := routingPrioOf(acc), routingPrioOf(selected)
+			if pa < ps {
 				selected = acc
-			} else if acc.Priority == selected.Priority {
+			} else if pa == ps {
 				switch {
 				case acc.LastUsedAt == nil && selected.LastUsedAt != nil:
 					selected = acc
@@ -4478,7 +4565,7 @@ func rewriteSystemForNonClaudeCodeWithPromptBlocks(body []byte, system any, expa
 	}
 
 	// 2. 构造 system 数组，对齐真实 Claude Code CLI 的 3-block 形态：
-	//    [0] billing attribution block（cc_version={cliVer}.{fp}; cc_entrypoint=cli; cch=00000;）
+	//    [0] billing attribution block（cc_version={cliVer}.{fp}; cc_entrypoint=cli;）
 	//    [1] "You are Claude Code..." 身份前缀 block（默认不带 cache_control）
 	//    [2] 工具无关的通用提示词扩充 block（带 cache_control 作为稳定缓存断点）
 	//
@@ -4486,9 +4573,9 @@ func rewriteSystemForNonClaudeCodeWithPromptBlocks(body []byte, system any, expa
 	//    区别于真实 CLI。这里注入 claudeCodeSystemPromptExpansion（中性段落）把形态做到
 	//    接近真实，同时不注入会污染被代理用户行为的工具专属指令。
 	//
-	//    billing block 的 cch=00000 是占位符，会被 buildUpstreamRequest 里的
-	//    signBillingHeaderCCH 替换成 xxhash64 签名。缺失 billing block 的系统 payload
-	//    是 Anthropic 判定第三方的关键信号之一（真实 CLI 每个请求都带）。
+	//    缺失 billing block 的系统 payload 是 Anthropic 判定第三方的关键信号之一
+	//    （真实 CLI 每个请求都带）。新版 CLI 已取消 cch=... 签名字段，故 block 不再注入
+	//    cch（见 buildBillingAttributionText）。
 	systemBlocks, blockErr := buildClaudeOAuthSystemPromptBlocksJSON(body, expansionPrompt, blocksConfig)
 	if blockErr != nil {
 		logger.LegacyPrintf("service.gateway", "Warning: failed to build configured Claude OAuth system blocks: %v", blockErr)
@@ -6719,9 +6806,9 @@ func (s *GatewayService) buildUpstreamRequest(ctx context.Context, c *gin.Contex
 
 	// OAuth账号：应用统一指纹和metadata重写（受设置开关控制）
 	var fingerprint *Fingerprint
-	enableFP, enableMPT, enableCCH := true, false, false
+	enableFP, enableMPT := true, false
 	if s.settingService != nil {
-		enableFP, enableMPT, enableCCH = s.settingService.GetGatewayForwardingSettings(ctx)
+		enableFP, enableMPT, _ = s.settingService.GetGatewayForwardingSettings(ctx)
 	}
 	if account.IsOAuth() && s.identityService != nil {
 		// 1. 获取或创建指纹（包含随机生成的ClientID）
@@ -6773,11 +6860,6 @@ func (s *GatewayService) buildUpstreamRequest(ctx context.Context, c *gin.Contex
 	// 能力维度 body sanitize：与最终 anthropic-beta header 对称
 	if sanitized, changed := sanitizeAnthropicBodyForBetaTokens(body, finalBetaHeader); changed {
 		body = sanitized
-	}
-
-	// CCH 签名：将 cch=00000 占位符替换为 xxHash64 签名（需在所有 body 修改之后）
-	if enableCCH {
-		body = signBillingHeaderCCH(body)
 	}
 
 	req, err := http.NewRequestWithContext(ctx, "POST", targetURL, bytes.NewReader(body))
@@ -6870,6 +6952,48 @@ func (s *GatewayService) buildUpstreamRequest(ctx context.Context, c *gin.Contex
 	return req, body, nil
 }
 
+// vertexSupportedBetaTokens 是 Vertex AI 的 Anthropic 端点接受的 anthropic-beta
+// 白名单。Vertex 对任何未知 token 直接 HTTP 400，故采用白名单（与 Bedrock 的
+// bedrockSupportedBetaTokens 同思路）而非黑名单：未来 Claude Code 新增的、Vertex 尚未
+// 支持的 token 天然被剥离。当 Vertex 新增支持某 beta 时在此补充。
+//
+// 明确排除（issue #3358 中 Vertex 报 400 的 token）：advisor-tool-2026-03-01、
+// prompt-caching-scope-2026-01-05、redact-thinking-2026-02-12、
+// thinking-token-count-2026-05-13；以及 claude-code-20250219 / oauth-2025-04-20 等
+// 客户端身份 beta——Vertex service_account 走 Bearer 鉴权，不需要它们。
+var vertexSupportedBetaTokens = map[string]bool{
+	"context-1m-2025-08-07":                  true,
+	"context-management-2025-06-27":          true,
+	"fine-grained-tool-streaming-2025-05-14": true,
+	"interleaved-thinking-2025-05-14":        true,
+}
+
+// filterVertexBetaTokens 解析 client 的 anthropic-beta header，先剔除 drop 集合中的
+// token（BetaPolicy filter + 默认 drop），再只保留 Vertex 支持的 token，去重后逗号拼接。
+// 返回最终 header（可能为空字符串）。
+func filterVertexBetaTokens(header string, drop map[string]struct{}) string {
+	tokens := parseAnthropicBetaHeader(header)
+	if len(tokens) == 0 {
+		return ""
+	}
+	out := make([]string, 0, len(tokens))
+	seen := make(map[string]bool, len(tokens))
+	for _, t := range tokens {
+		if _, dropped := drop[t]; dropped {
+			continue
+		}
+		if !vertexSupportedBetaTokens[t] {
+			continue
+		}
+		if seen[t] {
+			continue
+		}
+		seen[t] = true
+		out = append(out, t)
+	}
+	return strings.Join(out, ",")
+}
+
 func (s *GatewayService) buildUpstreamRequestAnthropicVertex(
 	ctx context.Context,
 	c *gin.Context,
@@ -6884,14 +7008,27 @@ func (s *GatewayService) buildUpstreamRequestAnthropicVertex(
 		return nil, err
 	}
 
-	// 能力维度 sanitize：Vertex 路径上 anthropic-beta header 原样透传客户端值
-	// （下面白名单跳过 anthropic-version 但保留 anthropic-beta），依此决定是否
-	// 保留 body 中的 context_management，与 Anthropic 直连 / Bedrock 路径对称。
+	// 计算最终 outgoing anthropic-beta。Vertex AI 的 Anthropic 端点只接受一小撮
+	// beta token，未知 token 会直接 HTTP 400——近期 Claude Code CLI 透传的
+	// advisor-tool-2026-03-01 / prompt-caching-scope-2026-01-05 /
+	// redact-thinking-2026-02-12 / thinking-token-count-2026-05-13 都不被 Vertex 接受
+	// （issue #3358）。这里复用 BetaPolicy 的 block 检查（与 Bedrock 的
+	// resolveBedrockBetaTokensForRequest 对称），再按 vertexSupportedBetaTokens 白名单
+	// 剥离其余 token，使该路径与 Anthropic 直连 / Bedrock 路径行为一致。
+	clientBeta := ""
 	if c != nil && c.Request != nil {
-		clientBeta := getHeaderRaw(c.Request.Header, "anthropic-beta")
-		if sanitized, changed := sanitizeAnthropicBodyForBetaTokens(vertexBody, clientBeta); changed {
-			vertexBody = sanitized
-		}
+		clientBeta = getHeaderRaw(c.Request.Header, "anthropic-beta")
+	}
+	policy := s.evaluateBetaPolicy(ctx, clientBeta, account, modelID)
+	if policy.blockErr != nil {
+		return nil, policy.blockErr
+	}
+	finalBeta := filterVertexBetaTokens(clientBeta, mergeDropSets(policy.filterSet))
+
+	// 能力维度 sanitize：基于最终 beta（而非原始 client 值）决定是否保留 body 中的
+	// context_management，与 Anthropic 直连 / Bedrock 路径对称。
+	if sanitized, changed := sanitizeAnthropicBodyForBetaTokens(vertexBody, finalBeta); changed {
+		vertexBody = sanitized
 	}
 	fullURL, err := buildVertexAnthropicURL(account.VertexProjectID(), account.VertexLocation(modelID), modelID, reqStream)
 	if err != nil {
@@ -6922,6 +7059,13 @@ func (s *GatewayService) buildUpstreamRequestAnthropicVertex(
 	req.Header.Del("anthropic-version")
 	setHeaderRaw(req.Header, "authorization", "Bearer "+token)
 	setHeaderRaw(req.Header, "content-type", "application/json")
+
+	// 覆盖上面白名单 loop 写入的原始 client anthropic-beta，使用过滤后的最终值。
+	// finalBeta 为空（全部被剥离）时不下发该 header，与 Vertex 无 beta 请求一致。
+	deleteHeaderAllForms(req.Header, "anthropic-beta")
+	if finalBeta != "" {
+		setHeaderRaw(req.Header, "anthropic-beta", finalBeta)
+	}
 
 	s.debugLogGatewaySnapshot("UPSTREAM_FORWARD_VERTEX_ANTHROPIC", req.Header, vertexBody, map[string]string{
 		"url":        req.URL.String(),
@@ -10224,9 +10368,9 @@ func (s *GatewayService) buildCountTokensRequest(ctx context.Context, c *gin.Con
 
 	// OAuth 账号：应用统一指纹和重写 userID（受设置开关控制）
 	// 如果启用了会话ID伪装，会在重写后替换 session 部分为固定值
-	ctEnableFP, ctEnableMPT, ctEnableCCH := true, false, false
+	ctEnableFP, ctEnableMPT := true, false
 	if s.settingService != nil {
-		ctEnableFP, ctEnableMPT, ctEnableCCH = s.settingService.GetGatewayForwardingSettings(ctx)
+		ctEnableFP, ctEnableMPT, _ = s.settingService.GetGatewayForwardingSettings(ctx)
 	}
 	var ctFingerprint *Fingerprint
 	if account.IsOAuth() && s.identityService != nil {
@@ -10261,9 +10405,6 @@ func (s *GatewayService) buildCountTokensRequest(ctx context.Context, c *gin.Con
 		body = sanitized
 	}
 
-	if ctEnableCCH {
-		body = signBillingHeaderCCH(body)
-	}
 	body = sanitizeCountTokensRequestBody(body)
 
 	req, err := http.NewRequestWithContext(ctx, "POST", targetURL, bytes.NewReader(body))
