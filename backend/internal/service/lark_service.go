@@ -11,6 +11,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/Wei-Shaw/sub2api/internal/pkg/timezone"
 )
 
 const (
@@ -337,13 +339,13 @@ func buildAlertSimpleElements(rule *OpsAlertRule, event *OpsAlertEvent) []any {
 	severity := "-"
 	description := "-"
 	metricValue := "-"
-	firedAt := time.Now().UTC().Format("2006-01-02 15:04:05 UTC")
+	firedAt := timezone.FormatLocal(time.Now(), "2006-01-02 15:04:05 MST")
 	if rule != nil {
 		severity = strings.TrimSpace(rule.Severity)
 	}
 	if event != nil {
 		description = strings.TrimSpace(event.Description)
-		firedAt = event.FiredAt.UTC().Format("2006-01-02 15:04:05 UTC")
+		firedAt = timezone.FormatLocal(event.FiredAt, "2006-01-02 15:04:05 MST")
 		if event.MetricValue != nil {
 			metricValue = fmt.Sprintf("%.4f", *event.MetricValue)
 		}
@@ -473,7 +475,7 @@ func buildAlertRichElements(rule *OpsAlertRule, event *OpsAlertEvent) []any {
 		)
 	}
 
-	firedAt := event.FiredAt.UTC().Format("2006-01-02 15:04:05 UTC")
+	firedAt := timezone.FormatLocal(event.FiredAt, "2006-01-02 15:04:05 MST")
 	elements = append(elements, map[string]any{
 		"tag":      "note",
 		"elements": []any{map[string]any{"tag": "plain_text", "content": "🤖 sub2api ops alert · Fired at " + firedAt}},
@@ -691,7 +693,7 @@ func buildAccountAnomalyCard(accountName, platform, status, reason string) map[s
 		headerColor = "red"
 	}
 
-	now := time.Now().UTC().Format("2006-01-02 15:04:05 UTC")
+	now := timezone.FormatLocal(time.Now(), "2006-01-02 15:04:05 MST")
 
 	return map[string]any{
 		"config": map[string]any{"wide_screen_mode": true},
@@ -748,7 +750,7 @@ func buildPaymentOrderCard(o *PaymentOrderNotifyInfo) map[string]any {
 	if displayName == "" {
 		displayName = o.UserEmail
 	}
-	completedAt := o.CompletedAt.UTC().Format("2006-01-02 15:04:05 UTC")
+	completedAt := timezone.FormatLocal(o.CompletedAt, "2006-01-02 15:04:05 MST")
 
 	return map[string]any{
 		"config": map[string]any{"wide_screen_mode": true},

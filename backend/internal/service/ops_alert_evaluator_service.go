@@ -11,6 +11,7 @@ import (
 
 	"github.com/Wei-Shaw/sub2api/internal/config"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/logger"
+	"github.com/Wei-Shaw/sub2api/internal/pkg/timezone"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/usagestats"
 	"github.com/google/uuid"
 	"github.com/redis/go-redis/v9"
@@ -848,7 +849,7 @@ func opsAlertEmailVariables(rule *OpsAlertRule, event *OpsAlertEvent) map[string
 		"operator":          "-",
 		"metric_value":      "-",
 		"threshold_value":   "-",
-		"triggered_at":      time.Now().UTC().Format(time.RFC3339),
+		"triggered_at":      timezone.FormatLocal(time.Now(), time.RFC3339),
 		"alert_description": "-",
 	}
 	if rule != nil {
@@ -870,7 +871,7 @@ func opsAlertEmailVariables(rule *OpsAlertRule, event *OpsAlertEvent) map[string
 			variables["threshold_value"] = fmt.Sprintf("%.2f", *event.ThresholdValue)
 		}
 		if !event.FiredAt.IsZero() {
-			variables["triggered_at"] = event.FiredAt.UTC().Format(time.RFC3339)
+			variables["triggered_at"] = timezone.FormatLocal(event.FiredAt, time.RFC3339)
 		}
 		if strings.TrimSpace(event.Description) != "" {
 			variables["alert_description"] = strings.TrimSpace(event.Description)
@@ -907,7 +908,7 @@ func buildOpsAlertEmailBody(rule *OpsAlertRule, event *OpsAlertEvent) string {
 		htmlEscape(metric),
 		htmlEscape(rule.Operator),
 		htmlEscape(fmt.Sprintf("%s (threshold %s)", value, threshold)),
-		event.FiredAt.Format(time.RFC3339),
+		timezone.FormatLocal(event.FiredAt, time.RFC3339),
 		htmlEscape(event.Description),
 	)
 	body += buildOpsAlertEmailBreakdownHTML(event.Breakdown)
