@@ -73,6 +73,13 @@ func Location() *time.Location {
 	return location
 }
 
+// FormatLocal renders t in the configured timezone using the given layout.
+// Use this instead of t.UTC().Format(...) so timestamps follow the configured
+// timezone (e.g. Asia/Shanghai) rather than being pinned to UTC.
+func FormatLocal(t time.Time, layout string) string {
+	return t.In(Location()).Format(layout)
+}
+
 // Name returns the configured timezone name.
 func Name() string {
 	if tzName == "" {
