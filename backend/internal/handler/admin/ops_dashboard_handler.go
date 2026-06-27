@@ -341,7 +341,7 @@ func parseOpsBreakdownLimit(raw string) (int, error) {
 	}
 	n, err := strconv.Atoi(raw)
 	if err != nil || n < 1 || n > 100 {
-		return 0, fmt.Errorf("Invalid limit")
+		return 0, fmt.Errorf("invalid limit")
 	}
 	return n, nil
 }
@@ -446,7 +446,7 @@ func parseOpsDashboardErrorFilter(c *gin.Context, start, end time.Time) (*servic
 		}
 		id, err := strconv.ParseInt(v, 10, 64)
 		if err != nil || id <= 0 {
-			return nil, fmt.Errorf("Invalid %s", name)
+			return nil, fmt.Errorf("invalid %s", name)
 		}
 		return &id, nil
 	}
@@ -479,7 +479,7 @@ func parseOpsDashboardErrorFilter(c *gin.Context, start, end time.Time) (*servic
 			}
 			n, convErr := strconv.Atoi(p)
 			if convErr != nil || n < 0 {
-				return nil, fmt.Errorf("Invalid status_codes")
+				return nil, fmt.Errorf("invalid status_codes")
 			}
 			out = append(out, n)
 		}
